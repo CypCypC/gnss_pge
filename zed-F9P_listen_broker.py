@@ -7,27 +7,26 @@ import time
 import json
 
 # --------- GNSS (u-blox) ---------
-PORT = "COM5"
+PORT = "COM6"
 BAUDRATE = 115200
 
 # --------- MQTT ---------
-MQTT_BROKER = "127.0.0.1"   # ⚠️ si ton broker est ailleurs: ex "192.168.1.50"
+MQTT_BROKER = "127.0.0.1"  # <- IP/hostname du broker (ex: "192.168.1.50")
 MQTT_PORT = 1883
 MQTT_USERNAME = None
 MQTT_PASSWORD = None
 MQTT_KEEPALIVE = 60
 
 TOPIC = "TestTopic/VACOP/localisation/gnss"
-PUBLISH_EVERY_SEC = 0.2   # 5 Hz max
+PUBLISH_EVERY_SEC = 0.2  # 5 Hz max (évite de spam)
 
 def make_mqtt_client() -> mqtt.Client:
-    # ✅ API v2 pour enlever le DeprecationWarning
+    # API v2 (supprime le warning de dépréciation)
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
 
     if MQTT_USERNAME is not None:
         client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-    # Callbacks v2: signature différente
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             print(f"[MQTT] Connecté à {MQTT_BROKER}:{MQTT_PORT}")
@@ -40,7 +39,6 @@ def make_mqtt_client() -> mqtt.Client:
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
-    # Connexion
     client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
     client.loop_start()
     return client
@@ -50,31 +48,47 @@ def main():
     last_pub = 0.0
 
     with Serial(PORT, BAUDRATE, timeout=1) as ser:
-        ubr = UBXReader(ser)
+        ubr = UBXReader(ser)  # pas de protfilter -> compatible
 
-        print("Écoute du ZED-F9P + publication MQTT... (Ctrl+C pour arrêter)")
+        print("Écoute ZED-F9P (UBX/NMEA) + publication MQTT... Ctrl+C pour arrêter")
 
         try:
             while True:
                 raw, msg = ubr.read()
-                if not msg or getattr(msg, "identity", "") != "NAV-PVT":
+                if msg is None:
                     continue
 
-                lat = msg.lat * 1e-7
-                lon = msg.lon * 1e-7
-                ts = time.time()
+                ident = getattr(msg, "identity", "")
+                lat = None
+                lon = None
 
-                if ts - last_pub < PUBLISH_EVERY_SEC:
+                # ---- 1) UBX NAV-PVT ----
+                if ident == "NAV-PVT":
+                    lat = msg.lat * 1e-7
+                    lon = msg.lon * 1e-7
+
+                # ---- 2) NMEA GGA / RMC ----
+                elif ident in ("GNGGA", "GPGGA", "GNRMC", "GPRMC"):
+                    lat = getattr(msg, "lat", None) or getattr(msg, "latitude", None)
+                    lon = getattr(msg, "lon", None) or getattr(msg, "longitude", None)
+
+                # si on n'a pas réussi à extraire lat/lon, on ignore
+                if lat is None or lon is None:
+                    continue
+
+                now = time.time()
+                if now - last_pub < PUBLISH_EVERY_SEC:
                     continue
 
                 payload = {
-                    "lat": round(lat, 7),
-                    "lon": round(lon, 7),
-                    "timestamp": ts
+                    "lat": round(float(lat), 7),
+                    "lon": round(float(lon), 7),
+                    "timestamp": now,
+                    "source": ident  # optionnel: te dit si c'était UBX ou NMEA
                 }
 
                 mqtt_client.publish(TOPIC, json.dumps(payload), qos=0, retain=False)
-                last_pub = ts
+                last_pub = now
 
                 print(f"Published -> {payload}")
 
