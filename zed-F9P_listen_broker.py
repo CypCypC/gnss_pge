@@ -1,309 +1,217 @@
-#!/usr/bin/env python3
-"""
-ZED-F9P (UBX + NMEA) -> MQTT + logs locaux robustes (Raspberry-ready)
+# pip install pyserial pyubx2 paho-mqtt
 
-✅ Publie la position à fréquence fixe (ex: 5 Hz) sur TOPIC_POS
-✅ Publie RAWX (mesures satellites) à fréquence réduite (ex: 1 Hz) sur TOPIC_RAWX
-✅ Log local:
-   - UBX brut .ubx
-   - RAWX .csv
-   - PVT .csv
-✅ Flush + fsync réguliers (limite la perte en cas de coupure d’alim)
-
-Deps:
-  pip install pyserial pyubx2 paho-mqtt
-"""
-
-from __future__ import annotations
-
-import csv
 import json
-import os
 import time
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
-
-from serial import Serial
-from pyubx2 import UBXReader, UBX_PROTOCOL, NMEA_PROTOCOL
+import serial
 import paho.mqtt.client as mqtt
+from pyubx2 import UBXReader, UBX_PROTOCOL, NMEA_PROTOCOL
 
-# =========================
-# -------- CONFIG ---------
-# =========================
+# -------- GNSS ----------
+GNSS_PORT = "/dev/ttyACM0"
+GNSS_BAUD = 115200
 
-# GNSS (Raspberry / Linux)
-PORT = "/dev/ttyACM0"
-BAUDRATE = 115200
-
-# MQTT
-MQTT_BROKER = "neocampus.univ-tlse3.fr"
-MQTT_PORT = 10883
-MQTT_USERNAME = "test"
-MQTT_PASSWORD = "test"
+# -------- MQTT -
+MQTT_BROKER = "127.0.0.1"
+MQTT_PORT = 1883
+MQTT_USERNAME = None
+MQTT_PASSWORD = None
 MQTT_KEEPALIVE = 60
 
-TOPIC_BASE = "TestTopic/VACOP/localisation/gnss"
-TOPIC_POS = TOPIC_BASE + "/pos"
-TOPIC_RAWX = TOPIC_BASE + "/rawx"
 
-# Rates
-PUBLISH_POS_EVERY_SEC = 0.2   # 5 Hz position stable
-PUBLISH_RAWX_EVERY_SEC = 1.0  # 1 Hz RAWX (beaucoup plus lourd)
+TOPIC_GNSS = "TestTopic/VACOP/localisation/gnss"
 
-# Logging robustness
-FLUSH_EVERY_SEC = 1.0         # flush + fsync toutes les 1 s
-LOG_DIR = "."                 # dossier de sortie (ex: "/home/pi/logs")
+PUBLISH_EVERY_SEC = 0.2   # 5 Hz
+STATUS_EVERY_SEC = 2.0
 
-# =========================
-# -------- HELPERS --------
-# =========================
+def classify_solution(fix_type, carr_soln):
+    if fix_type is None:
+        return "UNKNOWN"
+    if fix_type < 2:
+        return "NO_FIX"
+    if carr_soln == 2:
+        return "RTK_FIXED"
+    if carr_soln == 1:
+        return "RTK_FLOAT"
+    if fix_type == 3:
+        return "FIX_3D"
+    if fix_type == 2:
+        return "FIX_2D"
+    return "UNKNOWN"
 
-def is_finite_number(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not (x != x or x in (float("inf"), -float("inf")))
-
-def is_valid_latlon(lat: Any, lon: Any) -> bool:
-    if not is_finite_number(lat) or not is_finite_number(lon):
-        return False
-    return -90.0 <= float(lat) <= 90.0 and -180.0 <= float(lon) <= 180.0
-
-def safe_round(x: Optional[float], nd: int) -> Optional[float]:
-    if x is None:
-        return None
-    return round(float(x), nd)
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-def fsync_file(f) -> None:
+def safe_int(x):
     try:
-        f.flush()
-        os.fsync(f.fileno())
+        return int(x) if x is not None else None
     except Exception:
-        # On ne veut pas faire planter le script pour un fsync
-        pass
+        return None
 
-# =========================
-# -------- MQTT --------
-# =========================
+def safe_float(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
 
-def make_mqtt_client() -> mqtt.Client:
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+def coords_ok(lat, lon):
+    if lat is None or lon is None:
+        return False
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return False
+    return True
 
-    if MQTT_USERNAME:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+def make_mqtt_client():
+    c = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    c.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-    def on_connect(c, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            print(f"[MQTT] Connecté à {MQTT_BROKER}:{MQTT_PORT}")
-        else:
-            print(f"[MQTT] Échec connexion, reason_code={reason_code}")
+    def on_connect(client, userdata, flags, reason_code, properties):
+        print(f"[MQTT] on_connect: {reason_code}")
 
-    def on_disconnect(c, userdata, disconnect_flags, reason_code, properties):
-        print(f"[MQTT] Déconnecté, reason_code={reason_code}")
+    def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        print(f"[MQTT] on_disconnect: {reason_code}")
 
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
+    c.on_connect = on_connect
+    c.on_disconnect = on_disconnect
+    c.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
+    c.loop_start()
+    return c
 
-    # Reconnexion auto (Paho gère la boucle)
-    client.reconnect_delay_set(min_delay=1, max_delay=30)
-
-    client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
-    client.loop_start()
-    return client
-
-# =========================
-# -------- MAIN --------
-# =========================
-
-def main() -> None:
-    ensure_dir(LOG_DIR)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    raw_ubx_path = os.path.join(LOG_DIR, f"gnss_raw_{timestamp}.ubx")
-    rawx_csv_path = os.path.join(LOG_DIR, f"rawx_{timestamp}.csv")
-    pvt_csv_path = os.path.join(LOG_DIR, f"pvt_{timestamp}.csv")
-
+def main():
     mqtt_client = make_mqtt_client()
 
-    # State "dernière info connue"
-    last_lat: Optional[float] = None
-    last_lon: Optional[float] = None
-    last_height_m: Optional[float] = None
-    last_fixType: Optional[int] = None
-    last_source: Optional[str] = None
+    ser = serial.Serial(GNSS_PORT, GNSS_BAUD, timeout=1)
+    ubr = UBXReader(ser, protfilter=UBX_PROTOCOL | NMEA_PROTOCOL)
 
-    # Dernier RAWX connu (on publie à fréquence réduite)
-    last_rawx_payload: Optional[Dict[str, Any]] = None
+    print(f"[GNSS] Listening on {GNSS_PORT} @ {GNSS_BAUD} (UBX+NMEA)")
+    print(f"[GNSS] Publishing to {TOPIC_GNSS}")
 
-    # Rate limit
-    last_pub_pos = 0.0
-    last_pub_rawx = 0.0
+    last_pub = 0.0
+    last_status = 0.0
 
-    # Flush/fsync pacing
-    last_flush = 0.0
+    # Dernières infos connues
+    last_lat = None
+    last_lon = None
+    last_alt_m = None
+    last_source = None
 
-    print("ZED-F9P -> MQTT + logs locaux")
-    print(f"   Serial: {PORT} @ {BAUDRATE}")
-    print(f"   MQTT:   {MQTT_BROKER}:{MQTT_PORT}")
-    print(f"   Topics: {TOPIC_POS} (pos), {TOPIC_RAWX} (rawx)")
-    print("")
+    last_fixType = None
+    last_carrSoln = None
+    last_hAcc_m = None
+    last_vAcc_m = None
+    last_solution = "UNKNOWN"
 
-    with open(raw_ubx_path, "ab") as fubx, \
-         open(rawx_csv_path, "w", newline="") as frawx, \
-         open(pvt_csv_path, "w", newline="") as fpvt, \
-         Serial(PORT, BAUDRATE, timeout=1) as ser:
+    try:
+        while True:
+            raw, msg = ubr.read()
+            now = time.time()
 
-        rawx_writer = csv.writer(frawx)
-        pvt_writer = csv.writer(fpvt)
+            if msg is None:
+                # optionnel: statut périodique même sans message
+                if now - last_status >= STATUS_EVERY_SEC:
+                    payload = {
+                        "timestamp": now,
+                        "source": last_source,
+                        "latitude": None,
+                        "longitude": None,
+                        "alt_m": None,
+                        "fixType": last_fixType,
+                        "carrSoln": last_carrSoln,
+                        "solution": last_solution,
+                        "hAcc_m": last_hAcc_m,
+                        "vAcc_m": last_vAcc_m,
+                        "note": "no decoded msg yet"
+                    }
+                    mqtt_client.publish(TOPIC_GNSS, json.dumps(payload), qos=0, retain=False)
+                    print("[STATUS] no msg decoded yet")
+                    last_status = now
+                continue
 
-        rawx_writer.writerow([
-            "time",
-            "gnssId", "svId", "sigId", "freqId",
-            "prMes", "cpMes", "doppler", "cno"
-        ])
-        pvt_writer.writerow(["time", "lat", "lon", "height_m", "fixType", "source"])
+            ident = getattr(msg, "identity", "")
 
-        ubr = UBXReader(ser, protfilter=UBX_PROTOCOL | NMEA_PROTOCOL)
+            # --- UBX NAV-PVT (meilleure source qualité) ---
+            if ident == "NAV-PVT":
+                last_fixType = safe_int(getattr(msg, "fixType", None))
+                last_carrSoln = safe_int(getattr(msg, "carrSoln", None))
 
+                hAcc_mm = getattr(msg, "hAcc", None)
+                vAcc_mm = getattr(msg, "vAcc", None)
+                last_hAcc_m = (safe_float(hAcc_mm) / 1000.0) if hAcc_mm is not None else None
+                last_vAcc_m = (safe_float(vAcc_mm) / 1000.0) if vAcc_mm is not None else None
+                last_solution = classify_solution(last_fixType, last_carrSoln)
+
+                # lat/lon UBX: 1e-7 deg
+                last_lat = safe_float(getattr(msg, "lat", None))
+                last_lon = safe_float(getattr(msg, "lon", None))
+                if last_lat is not None: last_lat *= 1e-7
+                if last_lon is not None: last_lon *= 1e-7
+
+                hmsl_mm = getattr(msg, "hMSL", None)
+                last_alt_m = (safe_float(hmsl_mm) / 1000.0) if hmsl_mm is not None else None
+
+                last_source = "NAV-PVT"
+
+            # --- NMEA fallback (position) ---
+            elif ident in ("GNGGA", "GPGGA", "GNRMC", "GPRMC"):
+                lat = safe_float(getattr(msg, "lat", None))
+                lon = safe_float(getattr(msg, "lon", None))
+                if coords_ok(lat, lon):
+                    last_lat, last_lon = lat, lon
+                    last_source = ident
+
+            # --- Publication throttled ---
+            if now - last_pub < PUBLISH_EVERY_SEC:
+                continue
+
+            # Si pas encore de coordonnée valide, on envoie un statut (moins souvent)
+            if not coords_ok(last_lat, last_lon):
+                if now - last_status >= STATUS_EVERY_SEC:
+                    payload = {
+                        "timestamp": now,
+                        "source": last_source,
+                        "latitude": None,
+                        "longitude": None,
+                        "alt_m": last_alt_m,
+                        "fixType": last_fixType,
+                        "carrSoln": last_carrSoln,
+                        "solution": last_solution,
+                        "hAcc_m": last_hAcc_m,
+                        "vAcc_m": last_vAcc_m,
+                        "note": "no valid coords yet"
+                    }
+                    mqtt_client.publish(TOPIC_GNSS, json.dumps(payload), qos=0, retain=False)
+                    print("[STATUS] no valid coords yet | fixType=", last_fixType, "sol=", last_solution)
+                    last_status = now
+                last_pub = now
+                continue
+
+            # Payload normal (coords OK)
+            payload = {
+                "timestamp": now,
+                "source": last_source,
+                "latitude": round(last_lat, 7),
+                "longitude": round(last_lon, 7),
+                "alt_m": last_alt_m,
+
+                "fixType": last_fixType,
+                "carrSoln": last_carrSoln,
+                "solution": last_solution,
+                "hAcc_m": last_hAcc_m,
+                "vAcc_m": last_vAcc_m,
+            }
+
+            mqtt_client.publish(TOPIC_GNSS, json.dumps(payload), qos=0, retain=False)
+            print(f"[PUB] lat={payload['latitude']:.7f} lon={payload['longitude']:.7f} sol={payload['solution']} src={payload['source']}")
+            last_pub = now
+
+    except KeyboardInterrupt:
+        print("\n[STOP] Ctrl+C")
+    finally:
         try:
-            while True:
-                raw, msg = ubr.read()
-                if msg is None:
-                    # Même si rien ne vient, on peut tenter de publier à fréquence fixe (avec dernier état)
-                    pass
-                else:
-                    now = time.time()
-
-                    # Sauvegarde UBX brut (inclut NMEA aussi, car 'raw' = bytes reçus)
-                    if raw:
-                        fubx.write(raw)
-
-                    ident = getattr(msg, "identity", "")
-
-                    # ----------- RXM-RAWX (mesures satellites) -----------
-                    if ident == "RXM-RAWX":
-                        measurements = []
-                        try:
-                            num = int(msg.numMeas)
-                        except Exception:
-                            num = 0
-
-                        for i in range(1, num + 1):
-                            sat = {
-                                "gnssId": getattr(msg, f"gnssId_{i:02d}", None),
-                                "svId": getattr(msg, f"svId_{i:02d}", None),
-                                "sigId": getattr(msg, f"sigId_{i:02d}", None),
-                                "freqId": getattr(msg, f"freqId_{i:02d}", None),
-                                "prMes": getattr(msg, f"prMes_{i:02d}", None),
-                                "cpMes": getattr(msg, f"cpMes_{i:02d}", None),
-                                "doppler": getattr(msg, f"doMes_{i:02d}", None),
-                                "cno": getattr(msg, f"cno_{i:02d}", None),
-                            }
-                            measurements.append(sat)
-                            rawx_writer.writerow([
-                                now,
-                                sat["gnssId"], sat["svId"], sat["sigId"], sat["freqId"],
-                                sat["prMes"], sat["cpMes"], sat["doppler"], sat["cno"]
-                            ])
-
-                        # On stocke le dernier RAWX complet; publication rate-limited plus bas
-                        last_rawx_payload = {
-                            "type": "RAWX",
-                            "timestamp": now,
-                            "numMeas": len(measurements),
-                            "measurements": measurements,
-                        }
-
-                    # ----------- NAV-PVT (solution de position) -----------
-                    elif ident == "NAV-PVT":
-                        # lat/lon en 1e-7 deg ; height en mm
-                        try:
-                            fixType = int(msg.fixType)
-                        except Exception:
-                            fixType = None
-
-                        # On accepte à partir de 2 (2D) comme dans ton 1er code
-                        if fixType is not None and fixType >= 2:
-                            lat = msg.lat * 1e-7
-                            lon = msg.lon * 1e-7
-                            height_m = msg.height * 1e-3
-
-                            if is_valid_latlon(lat, lon):
-                                last_lat = float(lat)
-                                last_lon = float(lon)
-                                last_height_m = float(height_m)
-                                last_fixType = fixType
-                                last_source = "UBX-NAV-PVT"
-
-                                pvt_writer.writerow([now, last_lat, last_lon, last_height_m, last_fixType, last_source])
-
-                    # ----------- NMEA fallback (GGA/RMC) -----------
-                    elif ident in ("GNGGA", "GPGGA", "GNRMC", "GPRMC"):
-                        lat = getattr(msg, "lat", None)
-                        lon = getattr(msg, "lon", None)
-
-                        # PyUBX2 retourne généralement lat/lon déjà en degrés décimaux
-                        if is_valid_latlon(lat, lon):
-                            last_lat = float(lat)
-                            last_lon = float(lon)
-                            last_height_m = last_height_m  # pas toujours dispo dans ces phrases
-                            last_fixType = last_fixType
-                            last_source = ident
-
-                # ============ Publication à fréquence fixe ============
-                now_pub = time.time()
-
-                # ---- Publish position @ 5 Hz ----
-                if now_pub - last_pub_pos >= PUBLISH_POS_EVERY_SEC:
-                    if is_valid_latlon(last_lat, last_lon):
-                        payload_pos = {
-                            "type": "GNSS",
-                            "timestamp": now_pub,
-                            "lat": safe_round(last_lat, 7),
-                            "lon": safe_round(last_lon, 7),
-                            "height_m": safe_round(last_height_m, 2),
-                            "fixType": last_fixType,
-                            "source": last_source,
-                        }
-                        mqtt_client.publish(TOPIC_POS, json.dumps(payload_pos), qos=0, retain=False)
-                        last_pub_pos = now_pub
-                        print(f"[POS] {payload_pos}")
-                    else:
-                        # On avance quand même l’horloge de publication pour éviter spam CPU
-                        last_pub_pos = now_pub
-                        print("[POS] Coordonnées invalides (pas de publish)")
-
-                # ---- Publish RAWX @ 1 Hz ----
-                if last_rawx_payload is not None and (now_pub - last_pub_rawx >= PUBLISH_RAWX_EVERY_SEC):
-                    mqtt_client.publish(TOPIC_RAWX, json.dumps(last_rawx_payload), qos=0, retain=False)
-                    last_pub_rawx = now_pub
-                    print(f"[RAWX] Publié numMeas={last_rawx_payload.get('numMeas')}")
-
-                # ============ Flush + fsync réguliers ============
-                if now_pub - last_flush >= FLUSH_EVERY_SEC:
-                    fsync_file(fubx)
-                    fsync_file(frawx)
-                    fsync_file(fpvt)
-                    last_flush = now_pub
-
-        except KeyboardInterrupt:
-            print("\n Arrêt utilisateur (Ctrl+C)")
-        finally:
-            try:
-                # flush final
-                fsync_file(fubx)
-                fsync_file(frawx)
-                fsync_file(fpvt)
-            except Exception:
-                pass
             mqtt_client.loop_stop()
             mqtt_client.disconnect()
-
-    print("\n Fichiers générés :")
-    print(f" - {raw_ubx_path}")
-    print(f" - {rawx_csv_path}")
-    print(f" - {pvt_csv_path}")
-
+        except Exception:
+            pass
+        try:
+            ser.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
